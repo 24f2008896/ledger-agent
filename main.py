@@ -24,6 +24,23 @@ orders = []
 rates = {}
 
 REGIONS = {"Central", "East", "North", "South", "West"}
+PRODUCTS = [
+    "Air Fryer", "Blender", "Grinder", "Juicer",
+    "Kettle", "Mixer", "Rice Cooker", "Toaster",
+]
+
+ALLOWED_METRICS = {
+    "revenue",
+    "refunds",
+    "order_count",
+    "unique_customer_count",
+    "units_sold",
+    "top_product",
+    "product_revenue",
+    "customer_spending",
+    "top_customer",
+    "average_order_value",
+}
 
 
 def parse_date(value):
@@ -45,13 +62,14 @@ def load_ledger():
     export_response = session.get(discovery["links"]["export"], timeout=30)
     export_response.raise_for_status()
 
+    # The export is NDJSON: one JSON object per line.
     records = [
         json.loads(line)
         for line in export_response.text.splitlines()
         if line.strip()
     ]
 
-    # Retain only the most recently updated record for each order ID.
+    # Keep only the latest version of each order ID.
     latest = {}
     for record in records:
         order_id = record["id"]
@@ -82,39 +100,41 @@ class QuestionRequest(BaseModel):
 
 def interpret_question(question):
     instructions = """
-Convert the question into JSON with these keys:
+Convert the user's question into one JSON object with keys:
 metric, region, product, customer, start_date, end_date,
 status, date_field.
 
 Allowed metrics:
-revenue, refunds, order_count, units_sold,
-top_product, product_revenue, customer_spending,
+revenue, refunds, order_count, unique_customer_count,
+units_sold, top_product, product_revenue, customer_spending,
 top_customer, average_order_value.
 
 Use null for unspecified filters.
 Dates must be YYYY-MM-DD.
-For a month, start_date is the first day and end_date
-is the first day of the next month.
+For a month, start_date is its first day and end_date
+is the first day of the following month.
+
+Regions:
+Central, East, North, South, West.
 
 Products:
 Air Fryer, Blender, Grinder, Juicer, Kettle, Mixer,
 Rice Cooker, Toaster.
 
-Regions:
-Central, East, North, South, West.
-
 Rules:
-- "how many", "count", or "number of" means order_count.
-- "on average", "average order value", or "worth on average"
-  means average_order_value.
-- Revenue counts paid orders only.
-- Refunds refer to refunded orders.
-- Use created_at for orders placed, ordered, or created.
+- "How many different/unique/distinct customers" means
+  unique_customer_count, not order_count.
+- Count each customer only once for unique_customer_count.
+- "How many orders" or "count orders" means order_count.
+- "On average" or "average order value" means average_order_value.
+- Revenue counts only paid orders.
+- Refund questions refer to refunded orders.
+- Use created_at for orders described as placed, ordered, or created.
 - Use updated_at when explicitly asked about update or
   refund-processing dates.
 - Otherwise use created_at.
 - Customer filters use IDs such as C1001.
-Return valid JSON only.
+Return JSON only.
 """
 
     result = client.chat.completions.create(
@@ -131,23 +151,25 @@ Return valid JSON only.
     query = json.loads(result.choices[0].message.content)
     q = question.casefold()
 
-    allowed_metrics = {
-        "revenue",
-        "refunds",
-        "order_count",
-        "units_sold",
-        "top_product",
-        "product_revenue",
-        "customer_spending",
-        "top_customer",
-        "average_order_value",
-    }
-
-    if query.get("metric") not in allowed_metrics:
+    if query.get("metric") not in ALLOWED_METRICS:
         raise ValueError("Unsupported metric")
 
-    # Override the model when the question clearly states the metric.
-    if re.search(r"\b(count|how many|number of)\b", q):
+    # Check distinct-customer questions BEFORE generic count questions.
+    customer_count_question = bool(
+        re.search(
+            r"\b(different|distinct|unique)\s+customers?\b",
+            q,
+        )
+        or re.search(
+            r"\b(how many|count|number of)\s+"
+            r"(different|distinct|unique)\s+customers?\b",
+            q,
+        )
+    )
+
+    if customer_count_question:
+        query["metric"] = "unique_customer_count"
+    elif re.search(r"\b(count|how many|number of)\b", q):
         query["metric"] = "order_count"
     elif re.search(
         r"\b(on average|average|average order value|"
@@ -156,23 +178,19 @@ Return valid JSON only.
     ):
         query["metric"] = "average_order_value"
 
-    # Explicitly identify a region mentioned in the question.
+    # Detect an explicitly mentioned region.
     for region in REGIONS:
         if re.search(r"\b" + re.escape(region.casefold()) + r"\b", q):
             query["region"] = region
             break
 
-    # Explicitly identify a product mentioned in the question.
-    products = [
-        "Air Fryer", "Blender", "Grinder", "Juicer",
-        "Kettle", "Mixer", "Rice Cooker", "Toaster",
-    ]
-    for product in products:
+    # Detect an explicitly mentioned product.
+    for product in PRODUCTS:
         if product.casefold() in q:
             query["product"] = product
             break
 
-    # Set status from explicit wording.
+    # Select the order status.
     if re.search(r"\b(refunded|refunds|refund)\b", q):
         query["status"] = "refunded"
     elif re.search(r"\b(paid|payment|payments)\b", q):
@@ -184,7 +202,7 @@ Return valid JSON only.
     else:
         query["status"] = "paid"
 
-    # Choose the date field according to what the question asks.
+    # Choose the appropriate date field.
     if re.search(r"\b(placed|ordered|created)\b", q):
         query["date_field"] = "created_at"
     elif re.search(
@@ -197,7 +215,7 @@ Return valid JSON only.
     else:
         query["date_field"] = "created_at"
 
-    # Do not apply invented dates to questions without a date period.
+    # Clear dates if the question doesn't specify a date period.
     has_date_period = bool(
         re.search(
             r"\b(january|february|march|april|may|june|july|"
@@ -206,6 +224,7 @@ Return valid JSON only.
             q,
         )
     )
+
     if not has_date_period:
         query["start_date"] = None
         query["end_date"] = None
@@ -263,7 +282,6 @@ def calculate(query):
         currency = order["currency"]
         if currency not in rates:
             raise ValueError(f"Unknown currency: {currency}")
-
         return Decimal(str(order["amount"])) * Decimal(str(rates[currency]))
 
     def money(value):
@@ -274,6 +292,11 @@ def calculate(query):
     if metric == "order_count":
         return len(filtered)
 
+    if metric == "unique_customer_count":
+        # A customer with multiple matching orders counts only once.
+        unique_customers = {order["customer"] for order in filtered}
+        return len(unique_customers)
+
     if metric == "units_sold":
         return sum(int(order["qty"]) for order in filtered)
 
@@ -283,13 +306,8 @@ def calculate(query):
     if metric == "average_order_value":
         if not filtered:
             raise ValueError(
-                "No matching orders for average_order_value. "
-                f"Filters: status={required_status}, "
-                f"region={query.get('region')}, "
-                f"start_date={query.get('start_date')}, "
-                f"end_date={query.get('end_date')}"
+                "No matching orders for average_order_value"
             )
-
         total_usd = sum((usd(o) for o in filtered), Decimal("0"))
         return money(total_usd / Decimal(len(filtered)))
 
@@ -298,7 +316,6 @@ def calculate(query):
         for order in filtered:
             product = order["product"]
             totals[product] = totals.get(product, Decimal("0")) + usd(order)
-
         return money(max(totals.values())) if totals else 0.00
 
     if metric == "top_product":
@@ -306,7 +323,6 @@ def calculate(query):
         for order in filtered:
             product = order["product"]
             totals[product] = totals.get(product, 0) + int(order["qty"])
-
         return max(totals, key=totals.get) if totals else None
 
     if metric in {"customer_spending", "top_customer"}:
@@ -321,8 +337,6 @@ def calculate(query):
         if metric == "top_customer":
             return max(totals, key=totals.get)
 
-        # If a particular customer was requested, return that customer's
-        # spending rather than the sum of every customer's spending.
         if query.get("customer"):
             return money(totals.get(query["customer"], Decimal("0")))
 
