@@ -1,4 +1,3 @@
-
 import json
 import os
 import re
@@ -19,10 +18,12 @@ TZ = ZoneInfo("Asia/Kolkata")
 
 app = FastAPI(title="Acme Ledger Agent")
 session = requests.Session()
-client = OpenAI()  # Uses OPENAI_API_KEY and OPENAI_BASE_URL from environment
+client = OpenAI()
 
 orders = []
 rates = {}
+
+REGIONS = {"Central", "East", "North", "South", "West"}
 
 
 def parse_date(value):
@@ -33,7 +34,6 @@ def parse_date(value):
 
 
 def load_ledger():
-    # Discover the ledger's export and exchange-rate endpoints.
     response = session.get(START_URL, timeout=15)
     response.raise_for_status()
     discovery = response.json()
@@ -45,14 +45,13 @@ def load_ledger():
     export_response = session.get(discovery["links"]["export"], timeout=30)
     export_response.raise_for_status()
 
-    # The export is NDJSON: one JSON object per line.
     records = [
         json.loads(line)
         for line in export_response.text.splitlines()
         if line.strip()
     ]
 
-    # Keep the latest version of each order ID.
+    # Retain only the most recently updated record for each order ID.
     latest = {}
     for record in records:
         order_id = record["id"]
@@ -83,45 +82,39 @@ class QuestionRequest(BaseModel):
 
 def interpret_question(question):
     instructions = """
-Convert the user's question into one JSON object.
+Convert the question into JSON with these keys:
+metric, region, product, customer, start_date, end_date,
+status, date_field.
 
 Allowed metrics:
 revenue, refunds, order_count, units_sold,
 top_product, product_revenue, customer_spending,
 top_customer, average_order_value.
 
-Return these keys:
-metric, region, product, customer, start_date, end_date,
-status, date_field.
-
 Use null for unspecified filters.
 Dates must be YYYY-MM-DD.
-For a month, start_date is its first day and end_date
-is the first day of the following month.
+For a month, start_date is the first day and end_date
+is the first day of the next month.
 
-Use the exact product spelling from this list:
+Products:
 Air Fryer, Blender, Grinder, Juicer, Kettle, Mixer,
 Rice Cooker, Toaster.
 
-Customer filters use IDs such as C1001.
+Regions:
+Central, East, North, South, West.
 
-Important rules:
-- Questions asking to count, how many, or the number of orders
-  must use metric order_count, even when they mention refunds.
-- Revenue counts only paid orders.
-- A question about refunded orders must use status refunded.
-- A question about paid orders must use status paid.
-- For order-count questions, count matching orders; do not return money.
-- Use created_at for orders described as placed, ordered, or created.
-- Use updated_at when the question explicitly asks when an order
-  was updated or when a refund was processed.
-- For other refund questions without an explicit date meaning,
-  use updated_at.
-- Use created_at for ordinary sales questions.
-- region, product, and customer should be null if unspecified.
-- status must be paid, refunded, void, or null.
-- date_field must be created_at or updated_at.
-- Return JSON only.
+Rules:
+- "how many", "count", or "number of" means order_count.
+- "on average", "average order value", or "worth on average"
+  means average_order_value.
+- Revenue counts paid orders only.
+- Refunds refer to refunded orders.
+- Use created_at for orders placed, ordered, or created.
+- Use updated_at when explicitly asked about update or
+  refund-processing dates.
+- Otherwise use created_at.
+- Customer filters use IDs such as C1001.
+Return valid JSON only.
 """
 
     result = client.chat.completions.create(
@@ -136,6 +129,7 @@ Important rules:
     )
 
     query = json.loads(result.choices[0].message.content)
+    q = question.casefold()
 
     allowed_metrics = {
         "revenue",
@@ -152,41 +146,69 @@ Important rules:
     if query.get("metric") not in allowed_metrics:
         raise ValueError("Unsupported metric")
 
-    # Enforce obvious intent from the original question rather than
-    # relying entirely on the model's interpretation.
-    question_lower = question.casefold()
-
-    if re.search(r"\b(count|how many|number of)\b", question_lower):
+    # Override the model when the question clearly states the metric.
+    if re.search(r"\b(count|how many|number of)\b", q):
         query["metric"] = "order_count"
+    elif re.search(
+        r"\b(on average|average|average order value|"
+        r"worth on average|per order)\b",
+        q,
+    ):
+        query["metric"] = "average_order_value"
 
-    # Explicit order status in the question takes priority.
-    if re.search(r"\b(refunded|refunds|refund)\b", question_lower):
+    # Explicitly identify a region mentioned in the question.
+    for region in REGIONS:
+        if re.search(r"\b" + re.escape(region.casefold()) + r"\b", q):
+            query["region"] = region
+            break
+
+    # Explicitly identify a product mentioned in the question.
+    products = [
+        "Air Fryer", "Blender", "Grinder", "Juicer",
+        "Kettle", "Mixer", "Rice Cooker", "Toaster",
+    ]
+    for product in products:
+        if product.casefold() in q:
+            query["product"] = product
+            break
+
+    # Set status from explicit wording.
+    if re.search(r"\b(refunded|refunds|refund)\b", q):
         query["status"] = "refunded"
-    elif re.search(r"\b(paid|payments)\b", question_lower):
+    elif re.search(r"\b(paid|payment|payments)\b", q):
         query["status"] = "paid"
-    elif re.search(r"\b(void|voided)\b", question_lower):
+    elif re.search(r"\b(void|voided)\b", q):
         query["status"] = "void"
-    elif query.get("metric") == "refunds":
+    elif query["metric"] == "refunds":
         query["status"] = "refunded"
     else:
         query["status"] = "paid"
 
-    # "Placed in February" means the order's creation date,
-    # not the date it was subsequently updated or refunded.
-    if re.search(r"\b(placed|ordered|created)\b", question_lower):
+    # Choose the date field according to what the question asks.
+    if re.search(r"\b(placed|ordered|created)\b", q):
         query["date_field"] = "created_at"
     elif re.search(
         r"\b(updated|update date|refund processed|processed date)\b",
-        question_lower,
+        q,
     ):
         query["date_field"] = "updated_at"
-    elif query.get("metric") == "refunds":
+    elif query["metric"] == "refunds":
         query["date_field"] = "updated_at"
     else:
         query["date_field"] = "created_at"
 
-    if query.get("status") not in {None, "paid", "refunded", "void"}:
-        raise ValueError("Unsupported order status")
+    # Do not apply invented dates to questions without a date period.
+    has_date_period = bool(
+        re.search(
+            r"\b(january|february|march|april|may|june|july|"
+            r"august|september|october|november|december|"
+            r"20\d{2}|between|from|during|before|after)\b",
+            q,
+        )
+    )
+    if not has_date_period:
+        query["start_date"] = None
+        query["end_date"] = None
 
     if query.get("date_field") not in {"created_at", "updated_at"}:
         query["date_field"] = "created_at"
@@ -196,29 +218,32 @@ Important rules:
 
 def calculate(query):
     metric = query["metric"]
-    filtered = []
     date_field = query.get("date_field", "created_at")
     required_status = query.get("status")
 
     if required_status is None:
         required_status = "refunded" if metric == "refunds" else "paid"
 
+    filtered = []
+
     for order in orders:
-        # Apply the requested status before calculating anything.
         if order["status"] != required_status:
             continue
 
-        if query.get("region"):
-            if order["region"].casefold() != query["region"].casefold():
-                continue
+        if query.get("region") and (
+            order["region"].casefold() != query["region"].casefold()
+        ):
+            continue
 
-        if query.get("product"):
-            if order["product"].casefold() != query["product"].casefold():
-                continue
+        if query.get("product") and (
+            order["product"].casefold() != query["product"].casefold()
+        ):
+            continue
 
-        if query.get("customer"):
-            if order["customer"].casefold() != query["customer"].casefold():
-                continue
+        if query.get("customer") and (
+            order["customer"].casefold() != query["customer"].casefold()
+        ):
+            continue
 
         date_value = parse_date(order[date_field])
 
@@ -239,33 +264,34 @@ def calculate(query):
         if currency not in rates:
             raise ValueError(f"Unknown currency: {currency}")
 
-        return (
-            Decimal(str(order["amount"]))
-            * Decimal(str(rates[currency]))
-        )
+        return Decimal(str(order["amount"])) * Decimal(str(rates[currency]))
 
     def money(value):
         return float(
-            value.quantize(
-                Decimal("0.01"),
-                rounding=ROUND_HALF_UP,
-            )
+            value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         )
 
-    # Counts are counts of unique, filtered order IDs.
     if metric == "order_count":
         return len(filtered)
 
     if metric == "units_sold":
         return sum(int(order["qty"]) for order in filtered)
 
-    if metric == "refunds":
+    if metric in {"revenue", "refunds"}:
         return money(sum((usd(o) for o in filtered), Decimal("0")))
 
-    if metric == "revenue":
-        # Revenue must always count paid orders only.
-        paid_orders = [o for o in filtered if o["status"] == "paid"]
-        return money(sum((usd(o) for o in paid_orders), Decimal("0")))
+    if metric == "average_order_value":
+        if not filtered:
+            raise ValueError(
+                "No matching orders for average_order_value. "
+                f"Filters: status={required_status}, "
+                f"region={query.get('region')}, "
+                f"start_date={query.get('start_date')}, "
+                f"end_date={query.get('end_date')}"
+            )
+
+        total_usd = sum((usd(o) for o in filtered), Decimal("0"))
+        return money(total_usd / Decimal(len(filtered)))
 
     if metric == "product_revenue":
         totals = {}
@@ -273,10 +299,7 @@ def calculate(query):
             product = order["product"]
             totals[product] = totals.get(product, Decimal("0")) + usd(order)
 
-        if not totals:
-            return 0.00
-
-        return money(max(totals.values()))
+        return money(max(totals.values())) if totals else 0.00
 
     if metric == "top_product":
         totals = {}
@@ -284,10 +307,7 @@ def calculate(query):
             product = order["product"]
             totals[product] = totals.get(product, 0) + int(order["qty"])
 
-        if not totals:
-            return None
-
-        return max(totals, key=totals.get)
+        return max(totals, key=totals.get) if totals else None
 
     if metric in {"customer_spending", "top_customer"}:
         totals = {}
@@ -301,16 +321,12 @@ def calculate(query):
         if metric == "top_customer":
             return max(totals, key=totals.get)
 
+        # If a particular customer was requested, return that customer's
+        # spending rather than the sum of every customer's spending.
+        if query.get("customer"):
+            return money(totals.get(query["customer"], Decimal("0")))
+
         return money(sum(totals.values(), Decimal("0")))
-
-    if metric == "average_order_value":
-        if not filtered:
-            return 0.00
-
-        return money(
-            sum((usd(o) for o in filtered), Decimal("0"))
-            / Decimal(len(filtered))
-        )
 
     raise ValueError("Unsupported calculation")
 
@@ -330,6 +346,7 @@ def answer_question(request: QuestionRequest):
 
     try:
         query = interpret_question(request.question)
+        print(f"Interpreted query: {query}")
         answer = calculate(query)
         return {"answer": answer}
     except Exception as exc:
