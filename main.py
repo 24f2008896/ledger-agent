@@ -69,7 +69,7 @@ def load_ledger():
         if line.strip()
     ]
 
-    # Keep only the latest version of each order ID.
+    # Keep the latest version of each order ID.
     latest = {}
     for record in records:
         order_id = record["id"]
@@ -124,9 +124,12 @@ Rice Cooker, Toaster.
 Rules:
 - "How many different/unique/distinct customers" means
   unique_customer_count, not order_count.
-- Count each customer only once for unique_customer_count.
 - "How many orders" or "count orders" means order_count.
-- "On average" or "average order value" means average_order_value.
+- "On average" means average_order_value.
+- "Which product earned the most revenue" means top_product.
+- For top_product, use revenue when the question asks which
+  product earned the most revenue; use quantity when it asks
+  which product sold the most units.
 - Revenue counts only paid orders.
 - Refund questions refer to refunded orders.
 - Use created_at for orders described as placed, ordered, or created.
@@ -154,12 +157,29 @@ Return JSON only.
     if query.get("metric") not in ALLOWED_METRICS:
         raise ValueError("Unsupported metric")
 
-    # Check distinct-customer questions BEFORE generic count questions.
+    # Explicitly recognize questions asking which product earned
+    # the most revenue. This must not be confused with units sold.
+    asks_top_product = (
+        bool(re.search(r"\b(which|what)\s+products?\b", q))
+        and bool(re.search(r"\b(most|highest|top)\b", q))
+    )
+    asks_revenue = bool(
+        re.search(r"\b(revenue|earned|earnings|sales value)\b", q)
+    )
+    asks_units = bool(
+        re.search(r"\b(units|quantities|quantity)\b", q)
+    )
+
+    if asks_top_product and asks_revenue:
+        query["metric"] = "top_product"
+        query["top_product_basis"] = "revenue"
+    elif asks_top_product and asks_units:
+        query["metric"] = "top_product"
+        query["top_product_basis"] = "quantity"
+
+    # Check distinct-customer questions before generic count questions.
     customer_count_question = bool(
-        re.search(
-            r"\b(different|distinct|unique)\s+customers?\b",
-            q,
-        )
+        re.search(r"\b(different|distinct|unique)\s+customers?\b", q)
         or re.search(
             r"\b(how many|count|number of)\s+"
             r"(different|distinct|unique)\s+customers?\b",
@@ -178,13 +198,13 @@ Return JSON only.
     ):
         query["metric"] = "average_order_value"
 
-    # Detect an explicitly mentioned region.
+    # Detect explicitly mentioned region.
     for region in REGIONS:
         if re.search(r"\b" + re.escape(region.casefold()) + r"\b", q):
             query["region"] = region
             break
 
-    # Detect an explicitly mentioned product.
+    # Detect explicitly mentioned product.
     for product in PRODUCTS:
         if product.casefold() in q:
             query["product"] = product
@@ -202,7 +222,7 @@ Return JSON only.
     else:
         query["status"] = "paid"
 
-    # Choose the appropriate date field.
+    # Select the correct date field.
     if re.search(r"\b(placed|ordered|created)\b", q):
         query["date_field"] = "created_at"
     elif re.search(
@@ -282,7 +302,10 @@ def calculate(query):
         currency = order["currency"]
         if currency not in rates:
             raise ValueError(f"Unknown currency: {currency}")
-        return Decimal(str(order["amount"])) * Decimal(str(rates[currency]))
+        return (
+            Decimal(str(order["amount"]))
+            * Decimal(str(rates[currency]))
+        )
 
     def money(value):
         return float(
@@ -293,9 +316,7 @@ def calculate(query):
         return len(filtered)
 
     if metric == "unique_customer_count":
-        # A customer with multiple matching orders counts only once.
-        unique_customers = {order["customer"] for order in filtered}
-        return len(unique_customers)
+        return len({order["customer"] for order in filtered})
 
     if metric == "units_sold":
         return sum(int(order["qty"]) for order in filtered)
@@ -305,9 +326,7 @@ def calculate(query):
 
     if metric == "average_order_value":
         if not filtered:
-            raise ValueError(
-                "No matching orders for average_order_value"
-            )
+            raise ValueError("No matching orders for average_order_value")
         total_usd = sum((usd(o) for o in filtered), Decimal("0"))
         return money(total_usd / Decimal(len(filtered)))
 
@@ -315,21 +334,38 @@ def calculate(query):
         totals = {}
         for order in filtered:
             product = order["product"]
-            totals[product] = totals.get(product, Decimal("0")) + usd(order)
+            totals[product] = (
+                totals.get(product, Decimal("0")) + usd(order)
+            )
         return money(max(totals.values())) if totals else 0.00
 
     if metric == "top_product":
         totals = {}
-        for order in filtered:
-            product = order["product"]
-            totals[product] = totals.get(product, 0) + int(order["qty"])
+
+        if query.get("top_product_basis") == "revenue":
+            # Compare each product's total revenue in USD.
+            for order in filtered:
+                product = order["product"]
+                totals[product] = (
+                    totals.get(product, Decimal("0")) + usd(order)
+                )
+        else:
+            # For questions about the most units sold.
+            for order in filtered:
+                product = order["product"]
+                totals[product] = (
+                    totals.get(product, 0) + int(order["qty"])
+                )
+
         return max(totals, key=totals.get) if totals else None
 
     if metric in {"customer_spending", "top_customer"}:
         totals = {}
         for order in filtered:
             customer = order["customer"]
-            totals[customer] = totals.get(customer, Decimal("0")) + usd(order)
+            totals[customer] = (
+                totals.get(customer, Decimal("0")) + usd(order)
+            )
 
         if not totals:
             return None if metric == "top_customer" else 0.00
@@ -338,7 +374,9 @@ def calculate(query):
             return max(totals, key=totals.get)
 
         if query.get("customer"):
-            return money(totals.get(query["customer"], Decimal("0")))
+            return money(
+                totals.get(query["customer"], Decimal("0"))
+            )
 
         return money(sum(totals.values(), Decimal("0")))
 
