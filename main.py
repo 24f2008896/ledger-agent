@@ -379,16 +379,18 @@ def calculate(query):
 
         return money(max(totals.values())) if totals else 0.00
 
+    
     if metric == "top_product":
         totals = {}
 
         for order in filtered:
             product = order["product"]
             totals[product] = (
-                totals.get(product, 0) + int(order["qty"])
+                totals.get(product, Decimal("0")) + usd(order)
             )
 
         return max(totals, key=totals.get) if totals else None
+
 
     if metric in {"customer_spending", "top_customer"}:
         totals = {}
