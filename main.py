@@ -342,20 +342,11 @@ def calculate(query):
     if metric == "top_product":
         totals = {}
 
-        if query.get("top_product_basis") == "revenue":
-            # Compare each product's total revenue in USD.
-            for order in filtered:
-                product = order["product"]
-                totals[product] = (
-                    totals.get(product, Decimal("0")) + usd(order)
-                )
-        else:
-            # For questions about the most units sold.
-            for order in filtered:
-                product = order["product"]
-                totals[product] = (
-                    totals.get(product, 0) + int(order["qty"])
-                )
+        for order in filtered:
+            product = order["product"]
+            totals[product] = (
+                totals.get(product, Decimal("0")) + usd(order)
+            )
 
         return max(totals, key=totals.get) if totals else None
 
