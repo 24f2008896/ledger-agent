@@ -24,9 +24,16 @@ orders = []
 rates = {}
 
 REGIONS = {"Central", "East", "North", "South", "West"}
+
 PRODUCTS = [
-    "Air Fryer", "Blender", "Grinder", "Juicer",
-    "Kettle", "Mixer", "Rice Cooker", "Toaster",
+    "Air Fryer",
+    "Blender",
+    "Grinder",
+    "Juicer",
+    "Kettle",
+    "Mixer",
+    "Rice Cooker",
+    "Toaster",
 ]
 
 ALLOWED_METRICS = {
@@ -45,8 +52,10 @@ ALLOWED_METRICS = {
 
 def parse_date(value):
     dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=TZ)
+
     return dt.astimezone(TZ)
 
 
@@ -55,11 +64,17 @@ def load_ledger():
     response.raise_for_status()
     discovery = response.json()
 
-    rate_response = session.get(discovery["links"]["rates"], timeout=15)
+    rate_response = session.get(
+        discovery["links"]["rates"],
+        timeout=15,
+    )
     rate_response.raise_for_status()
     exchange_rates = rate_response.json()["usd_per_unit"]
 
-    export_response = session.get(discovery["links"]["export"], timeout=30)
+    export_response = session.get(
+        discovery["links"]["export"],
+        timeout=30,
+    )
     export_response.raise_for_status()
 
     # The export is NDJSON: one JSON object per line.
@@ -69,10 +84,12 @@ def load_ledger():
         if line.strip()
     ]
 
-    # Keep the latest version of each order ID.
+    # Keep only the latest version of each order ID.
     latest = {}
+
     for record in records:
         order_id = record["id"]
+
         if (
             order_id not in latest
             or parse_date(record["updated_at"])
@@ -86,6 +103,7 @@ def load_ledger():
 @app.on_event("startup")
 def startup():
     global orders, rates
+
     try:
         orders, rates = load_ledger()
         print(f"Loaded {len(orders)} unique orders")
@@ -124,12 +142,9 @@ Rice Cooker, Toaster.
 Rules:
 - "How many different/unique/distinct customers" means
   unique_customer_count, not order_count.
+- Count each customer only once for unique_customer_count.
 - "How many orders" or "count orders" means order_count.
-- "On average" means average_order_value.
-- "Which product earned the most revenue" means top_product.
-- For top_product, use revenue when the question asks which
-  product earned the most revenue; use quantity when it asks
-  which product sold the most units.
+- "On average" or "average order value" means average_order_value.
 - Revenue counts only paid orders.
 - Refund questions refer to refunded orders.
 - Use created_at for orders described as placed, ordered, or created.
@@ -137,6 +152,7 @@ Rules:
   refund-processing dates.
 - Otherwise use created_at.
 - Customer filters use IDs such as C1001.
+
 Return JSON only.
 """
 
@@ -157,29 +173,12 @@ Return JSON only.
     if query.get("metric") not in ALLOWED_METRICS:
         raise ValueError("Unsupported metric")
 
-    # Explicitly recognize questions asking which product earned
-    # the most revenue. This must not be confused with units sold.
-    asks_top_product = (
-        bool(re.search(r"\b(which|what)\s+products?\b", q))
-        and bool(re.search(r"\b(most|highest|top)\b", q))
-    )
-    asks_revenue = bool(
-        re.search(r"\b(revenue|earned|earnings|sales value)\b", q)
-    )
-    asks_units = bool(
-        re.search(r"\b(units|quantities|quantity)\b", q)
-    )
-
-    if asks_top_product and asks_revenue:
-        query["metric"] = "top_product"
-        query["top_product_basis"] = "revenue"
-    elif asks_top_product and asks_units:
-        query["metric"] = "top_product"
-        query["top_product_basis"] = "quantity"
-
-    # Check distinct-customer questions before generic count questions.
+    # Detect questions asking for distinct customers.
     customer_count_question = bool(
-        re.search(r"\b(different|distinct|unique)\s+customers?\b", q)
+        re.search(
+            r"\b(different|distinct|unique)\s+customers?\b",
+            q,
+        )
         or re.search(
             r"\b(how many|count|number of)\s+"
             r"(different|distinct|unique)\s+customers?\b",
@@ -187,10 +186,12 @@ Return JSON only.
         )
     )
 
+    # IMPORTANT: Check average-value questions BEFORE generic
+    # count questions. "How many dollars is an order worth
+    # on average?" asks for an average, not an order count.
     if customer_count_question:
         query["metric"] = "unique_customer_count"
-    elif re.search(r"\b(count|how many|number of)\b", q):
-        query["metric"] = "order_count"
+
     elif re.search(
         r"\b(on average|average|average order value|"
         r"worth on average|per order)\b",
@@ -198,13 +199,16 @@ Return JSON only.
     ):
         query["metric"] = "average_order_value"
 
-    # Detect explicitly mentioned region.
+    elif re.search(r"\b(count|how many|number of)\b", q):
+        query["metric"] = "order_count"
+
+    # Detect an explicitly mentioned region.
     for region in REGIONS:
         if re.search(r"\b" + re.escape(region.casefold()) + r"\b", q):
             query["region"] = region
             break
 
-    # Detect explicitly mentioned product.
+    # Detect an explicitly mentioned product.
     for product in PRODUCTS:
         if product.casefold() in q:
             query["product"] = product
@@ -213,25 +217,32 @@ Return JSON only.
     # Select the order status.
     if re.search(r"\b(refunded|refunds|refund)\b", q):
         query["status"] = "refunded"
+
     elif re.search(r"\b(paid|payment|payments)\b", q):
         query["status"] = "paid"
+
     elif re.search(r"\b(void|voided)\b", q):
         query["status"] = "void"
+
     elif query["metric"] == "refunds":
         query["status"] = "refunded"
+
     else:
         query["status"] = "paid"
 
-    # Select the correct date field.
+    # Choose the appropriate date field.
     if re.search(r"\b(placed|ordered|created)\b", q):
         query["date_field"] = "created_at"
+
     elif re.search(
         r"\b(updated|update date|refund processed|processed date)\b",
         q,
     ):
         query["date_field"] = "updated_at"
+
     elif query["metric"] == "refunds":
         query["date_field"] = "updated_at"
+
     else:
         query["date_field"] = "created_at"
 
@@ -261,7 +272,9 @@ def calculate(query):
     required_status = query.get("status")
 
     if required_status is None:
-        required_status = "refunded" if metric == "refunds" else "paid"
+        required_status = (
+            "refunded" if metric == "refunds" else "paid"
+        )
 
     filtered = []
 
@@ -270,29 +283,36 @@ def calculate(query):
             continue
 
         if query.get("region") and (
-            order["region"].casefold() != query["region"].casefold()
+            order["region"].casefold()
+            != query["region"].casefold()
         ):
             continue
 
         if query.get("product") and (
-            order["product"].casefold() != query["product"].casefold()
+            order["product"].casefold()
+            != query["product"].casefold()
         ):
             continue
 
         if query.get("customer") and (
-            order["customer"].casefold() != query["customer"].casefold()
+            order["customer"].casefold()
+            != query["customer"].casefold()
         ):
             continue
 
         date_value = parse_date(order[date_field])
 
         if query.get("start_date"):
-            start = parse_date(query["start_date"] + "T00:00:00")
+            start = parse_date(
+                query["start_date"] + "T00:00:00"
+            )
             if date_value < start:
                 continue
 
         if query.get("end_date"):
-            end = parse_date(query["end_date"] + "T00:00:00")
+            end = parse_date(
+                query["end_date"] + "T00:00:00"
+            )
             if date_value >= end:
                 continue
 
@@ -300,8 +320,10 @@ def calculate(query):
 
     def usd(order):
         currency = order["currency"]
+
         if currency not in rates:
             raise ValueError(f"Unknown currency: {currency}")
+
         return (
             Decimal(str(order["amount"]))
             * Decimal(str(rates[currency]))
@@ -309,34 +331,52 @@ def calculate(query):
 
     def money(value):
         return float(
-            value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            value.quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
+            )
         )
 
     if metric == "order_count":
         return len(filtered)
 
     if metric == "unique_customer_count":
-        return len({order["customer"] for order in filtered})
+        # A customer with multiple matching orders counts once.
+        unique_customers = {
+            order["customer"] for order in filtered
+        }
+        return len(unique_customers)
 
     if metric == "units_sold":
         return sum(int(order["qty"]) for order in filtered)
 
     if metric in {"revenue", "refunds"}:
-        return money(sum((usd(o) for o in filtered), Decimal("0")))
+        return money(
+            sum((usd(order) for order in filtered), Decimal("0"))
+        )
 
     if metric == "average_order_value":
         if not filtered:
-            raise ValueError("No matching orders for average_order_value")
-        total_usd = sum((usd(o) for o in filtered), Decimal("0"))
+            raise ValueError(
+                "No matching orders for average_order_value"
+            )
+
+        total_usd = sum(
+            (usd(order) for order in filtered),
+            Decimal("0"),
+        )
+
         return money(total_usd / Decimal(len(filtered)))
 
     if metric == "product_revenue":
         totals = {}
+
         for order in filtered:
             product = order["product"]
             totals[product] = (
                 totals.get(product, Decimal("0")) + usd(order)
             )
+
         return money(max(totals.values())) if totals else 0.00
 
     if metric == "top_product":
@@ -345,13 +385,14 @@ def calculate(query):
         for order in filtered:
             product = order["product"]
             totals[product] = (
-                totals.get(product, Decimal("0")) + usd(order)
+                totals.get(product, 0) + int(order["qty"])
             )
 
         return max(totals, key=totals.get) if totals else None
 
     if metric in {"customer_spending", "top_customer"}:
         totals = {}
+
         for order in filtered:
             customer = order["customer"]
             totals[customer] = (
@@ -376,7 +417,10 @@ def calculate(query):
 
 @app.get("/")
 def health():
-    return {"status": "ok", "orders_loaded": len(orders)}
+    return {
+        "status": "ok",
+        "orders_loaded": len(orders),
+    }
 
 
 @app.post("/")
@@ -390,8 +434,13 @@ def answer_question(request: QuestionRequest):
     try:
         query = interpret_question(request.question)
         print(f"Interpreted query: {query}")
+
         answer = calculate(query)
         return {"answer": answer}
+
     except Exception as exc:
         print(f"Question failed: {exc}")
-        raise HTTPException(500, "Could not answer this question")
+        raise HTTPException(
+            500,
+            "Could not answer this question",
+        )
